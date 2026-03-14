@@ -1,0 +1,35 @@
+name: Bash Script CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate-script:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes shellcheck shfmt
+
+    - name: Verify executable bit in Git metadata
+      run: |
+        if [ ! -x sherpa ]; then
+          echo "Error: 'sherpa' is not marked as executable in the repository."
+          exit 1
+        fi
+
+    - name: Syntax check (bash -n)
+      run: bash -n sherpa
+
+    - name: Static analysis (shellcheck)
+      run: shellcheck sherpa
+
+    - name: Formatting check (shfmt)
+      run: shfmt -i 2 -d sherpa
+

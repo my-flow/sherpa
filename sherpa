@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -EeuoP pipefail
+
+check_dependencies() {
+  for cmd in awk cut grep himalaya jq mktemp parallel sed shasum timeout tr; do
+    if ! command -v "$cmd" &>/dev/null; then
+      echo "Missing required dependency: $cmd" >&2
+      exit 1
+    fi
+  done
+}
+
+# Remove leading and trailing whitespace from a string.
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  echo "$s"
+}
+
+# Read config file if present. XDG location takes precedence over ~/.sherpa/.
+# Only lines matching known SHERPA_* keys are applied; everything else is ignored.
+# Environment variables still override config file values via the defaults below.
+load_config() {
+  local -A allowed_keys=(
+    [SHERPA_HIMALAYA_TIMEOUT]=1
+    [SHERPA_HIMALAYA_THREAD_TIMEOUT]=1
+    [SHERPA_PARALLEL_FETCHES]=1
+    [SHERPA_THREAD_MAX_LENGTH]=1
+    [SHERPA_ENVELOPE_PAGE_SIZE]=1
+  )
+  local config key value
+  for config in \
+    "$HOME/.sherpa/sherpa.conf" \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/sherpa/sherpa.conf"; do
+    if [[ -f "$config" ]]; then
+      while IFS='=' read -r key value; do
+        key=$(trim "$key")
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        value=$(trim "$value")
+        [[ -v allowed_keys["$key"] ]] && export "$key=$value"
+      done <"$config"
+      break
+    fi
+  done
+
+  export SHERPA_HIMALAYA_TIMEOUT="${SHERPA_HIMALAYA_TIMEOUT:-30}"
+  export SHERPA_HIMALAYA_THREAD_TIMEOUT="${SHERPA_HIMALAYA_THREAD_TIMEOUT:-60}"
+  export SHERPA_PARALLEL_FETCHES="${SHERPA_PARALLEL_FETCHES:-4}"
+  export SHERPA_THREAD_MAX_LENGTH="${SHERPA_THREAD_MAX_LENGTH:-5000}"
+  export SHERPA_ENVELOPE_PAGE_SIZE="${SHERPA_ENVELOPE_PAGE_SIZE:-200}"
+  readonly SHERPA_HIMALAYA_TIMEOUT SHERPA_HIMALAYA_THREAD_TIMEOUT SHERPA_PARALLEL_FETCHES SHERPA_THREAD_MAX_LENGTH SHERPA_ENVELOPE_PAGE_SIZE
+}
+
+parse_args() {
+  export VERBOSE=false
+  for arg in "$@"; do
+    case "$arg" in
+    -v | --verbose) VERBOSE=true ;;
+    *)
+      echo "Usage: $0 [-v|--verbose]" >&2
+      exit 1
+      ;;
+    esac
+  done
+}
+
+log() {
+  if [[ "$VERBOSE" == true ]]; then
+    echo "[sherpa] $*" >&2
+  fi
+}
+export -f log
+
+# Strip HTML entities (numeric, hex, and named) and clean up whitespace.
+strip_html_entities() {
+  sed -E 's/&#x[0-9a-fA-F]+;//g; s/&#[0-9]+;//g; s/&[a-zA-Z]+;//g' |
+    tr -d '\r' |
+    awk 'NF'
+}
+export -f strip_html_entities
+
+# Fetch all folder names from the mailbox.
+fetch_folders() {
+  log "Fetching folder list"
+  local folders
+  folders=$(timeout "$SHERPA_HIMALAYA_TIMEOUT" himalaya folder list --output json | jq --raw-output '.[].name')
+  if [[ -z "$folders" ]]; then
+    log "Failed to fetch folders or no folders found"
+    exit 1
+  fi
+  echo "$folders"
+}
+
+# Fetch unseen mails for a single folder and emit JSON lines with a .folder field.
+# Paginates through results to avoid loading all envelopes in a single request.
+_fetch_folder_mails() {
+  local folder="$1"
+  local page=1 envelopes count
+
+  while :; do
+    envelopes=$(
+      timeout "$SHERPA_HIMALAYA_TIMEOUT" \
+        himalaya --output json envelope list \
+        --folder "$folder" \
+        --page "$page" \
+        --page-size "$SHERPA_ENVELOPE_PAGE_SIZE" \
+        -- "not flag seen" ||
+        {
+          log "Failed to list mails in \"$folder\" (page $page), skipping"
+          echo '[]'
+        }
+    )
+
+    count=$(echo "$envelopes" | jq 'length')
+    if [[ "$count" -eq 0 ]]; then
+      break
+    fi
+
+    echo "$envelopes" |
+      jq --compact-output --arg folder "$folder" '.[] | .folder = $folder'
+
+    if [[ "$count" -lt "$SHERPA_ENVELOPE_PAGE_SIZE" ]]; then
+      break
+    fi
+
+    page=$((page + 1))
+  done
+}
+export -f _fetch_folder_mails
+
+# For each folder, fetch unseen mails and write them as JSON lines to the
+# given output file. Each line is augmented with a .folder field.
+# Folders are fetched in parallel using GNU parallel.
+fetch_unseen_mails() {
+  local folders="$1" output_file="$2"
+  local folder_count
+
+  folder_count=$(echo "$folders" | grep --count . || true)
+  log "Fetching unseen mails across $folder_count folders in parallel"
+
+  echo "$folders" |
+    parallel --jobs "$SHERPA_PARALLEL_FETCHES" --halt soon,fail=10% --group \
+      _fetch_folder_mails {} >>"$output_file"
+
+  log "Finished fetching unseen mails from $folder_count folders"
+}
+
+# Fetch the thread for a single mail JSON line and emit an enriched JSON line.
+_fetch_mail_thread() {
+  local mail="$1"
+  local id folder thread
+
+  read -r id folder < <(echo "$mail" | jq --raw-output '[.id, .folder] | @tsv')
+
+  if ! thread=$(
+    timeout "$SHERPA_HIMALAYA_THREAD_TIMEOUT" \
+      himalaya message thread --folder "$folder" --preview -- "$id" |
+      strip_html_entities
+  ); then
+    log "Failed to fetch thread for message $id in \"$folder\""
+    echo "$mail" | jq '.thread = null'
+    return 0
+  fi
+
+  echo "$mail" |
+    jq --arg thread "$thread" --argjson maxlen "$SHERPA_THREAD_MAX_LENGTH" '.thread = ($thread | .[:$maxlen])'
+}
+export -f _fetch_mail_thread
+
+# For each mail, fetch the message thread, strip HTML entities, and write
+# the enriched JSON line to the given output file.
+# Threads are fetched in parallel using GNU parallel.
+fetch_threads() {
+  local mails_file="$1" output_file="$2"
+  local mail_count
+
+  mail_count=$(grep --count . "$mails_file" || true)
+  log "Fetching threads for $mail_count mails in parallel"
+
+  parallel --jobs "$SHERPA_PARALLEL_FETCHES" --halt soon,fail=10% --group \
+    _fetch_mail_thread {} <"$mails_file" >>"$output_file"
+
+  log "Finished fetching $mail_count threads"
+}
+
+# Deduplicate and aggregate thread entries into a final JSON array, sorted by
+# date descending.
+aggregate_results() {
+  local threads_file="$1"
+  jq --slurp '
+    group_by(.subject, (if .from then (.from.addr | ascii_downcase) else "" end), .date)
+    | map({
+        ids:            (map(.id) | unique),
+        from:           (if .[0].from then
+                           (if .[0].from.name != "" and .[0].from.name != null
+                            then .[0].from.name + " <" + (.[0].from.addr | ascii_downcase) + ">"
+                            else .[0].from.addr | ascii_downcase end)
+                         else "Unknown" end),
+        subject:        .[0].subject,
+        date:           .[0].date,
+        folders:        (map(.folder) | unique),
+        has_attachment: .[0].has_attachment,
+        thread:         .[0].thread
+      })
+    | sort_by(.date) | reverse
+  ' "$threads_file"
+}
+
+main() {
+  check_dependencies
+  load_config
+  parse_args "$@"
+
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  local mails_file="$tmpdir/mails" threads_file="$tmpdir/threads" result_file="$tmpdir/result"
+  local folders
+  folders=$(fetch_folders)
+
+  fetch_unseen_mails "$folders" "$mails_file"
+  fetch_threads "$mails_file" "$threads_file"
+  aggregate_results "$threads_file" >"$result_file"
+
+  local checksum
+  checksum=$(shasum -a 256 <"$result_file" | cut -d' ' -f1)
+
+  local jq_opts=()
+  [[ -t 1 ]] || jq_opts=(--compact-output)
+  jq "${jq_opts[@]}" --arg checksum "$checksum" '{checksum: $checksum, data: .}' "$result_file"
+}
+
+main "$@"
