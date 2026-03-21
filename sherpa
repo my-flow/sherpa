@@ -54,10 +54,12 @@ load_config() {
 
 parse_args() {
   export VERBOSE=false
+  export SHOW_ALL=false
   CLI_FOLDERS=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
     -v | --verbose) VERBOSE=true ;;
+    -a | --all) SHOW_ALL=true ;;
     --folder)
       if [[ $# -lt 2 ]]; then
         echo "Error: --folder requires an argument" >&2
@@ -67,7 +69,7 @@ parse_args() {
       shift
       ;;
     *)
-      echo "Usage: $0 [-v|--verbose] [--folder NAME ...]" >&2
+      echo "Usage: $0 [-v|--verbose] [-a|--all] [--folder NAME ...]" >&2
       exit 1
       ;;
     esac
@@ -109,13 +111,19 @@ _fetch_folder_mails() {
   local page=1 envelopes count
 
   while :; do
+    local -a envelope_cmd=(
+      timeout "$SHERPA_HIMALAYA_TIMEOUT"
+      himalaya --output json envelope list
+      --folder "$folder"
+      --page "$page"
+      --page-size "$SHERPA_ENVELOPE_PAGE_SIZE"
+    )
+    if [[ "$SHOW_ALL" != true ]]; then
+      envelope_cmd+=(-- "not flag seen")
+    fi
+
     envelopes=$(
-      timeout "$SHERPA_HIMALAYA_TIMEOUT" \
-        himalaya --output json envelope list \
-        --folder "$folder" \
-        --page "$page" \
-        --page-size "$SHERPA_ENVELOPE_PAGE_SIZE" \
-        -- "not flag seen" ||
+      "${envelope_cmd[@]}" ||
         {
           log "Failed to list mails in \"$folder\" (page $page), skipping"
           echo '[]'
@@ -139,21 +147,23 @@ _fetch_folder_mails() {
 }
 export -f _fetch_folder_mails
 
-# For each folder, fetch unseen mails and write them as JSON lines to the
-# given output file. Each line is augmented with a .folder field.
+# For each folder, fetch mails and write them as JSON lines to the given output
+# file. Each line is augmented with a .folder field. When SHOW_ALL is false
+# (the default), only unseen mails are fetched.
 # Folders are fetched in parallel using GNU parallel.
-fetch_unseen_mails() {
+fetch_mails() {
   local folders="$1" output_file="$2"
-  local folder_count
+  local folder_count label
 
   folder_count=$(echo "$folders" | grep --count . || true)
-  log "Fetching unseen mails across $folder_count folder(s) in parallel"
+  label=$([[ "$SHOW_ALL" == true ]] && echo "all" || echo "unseen")
+  log "Fetching $label mails across $folder_count folder(s) in parallel"
 
   echo "$folders" |
     parallel --jobs "$SHERPA_PARALLEL_FETCHES" --halt soon,fail=10% --group \
       _fetch_folder_mails {} >>"$output_file"
 
-  log "Finished fetching unseen mails from $folder_count folder(s)"
+  log "Finished fetching $label mails from $folder_count folder(s)"
 }
 
 # Fetch the thread for a single mail JSON line and emit an enriched JSON line.
@@ -247,7 +257,7 @@ main() {
     folders="$all_folders"
   fi
 
-  fetch_unseen_mails "$folders" "$mails_file"
+  fetch_mails "$folders" "$mails_file"
   fetch_threads "$mails_file" "$threads_file"
   aggregate_results "$threads_file" >"$result_file"
 
