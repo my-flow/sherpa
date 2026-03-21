@@ -54,14 +54,24 @@ load_config() {
 
 parse_args() {
   export VERBOSE=false
-  for arg in "$@"; do
-    case "$arg" in
+  CLI_FOLDERS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
     -v | --verbose) VERBOSE=true ;;
+    --folder)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --folder requires an argument" >&2
+        exit 1
+      fi
+      CLI_FOLDERS+=("$2")
+      shift
+      ;;
     *)
-      echo "Usage: $0 [-v|--verbose]" >&2
+      echo "Usage: $0 [-v|--verbose] [--folder NAME ...]" >&2
       exit 1
       ;;
     esac
+    shift
   done
 }
 
@@ -137,13 +147,13 @@ fetch_unseen_mails() {
   local folder_count
 
   folder_count=$(echo "$folders" | grep --count . || true)
-  log "Fetching unseen mails across $folder_count folders in parallel"
+  log "Fetching unseen mails across $folder_count folder(s) in parallel"
 
   echo "$folders" |
     parallel --jobs "$SHERPA_PARALLEL_FETCHES" --halt soon,fail=10% --group \
       _fetch_folder_mails {} >>"$output_file"
 
-  log "Finished fetching unseen mails from $folder_count folders"
+  log "Finished fetching unseen mails from $folder_count folder(s)"
 }
 
 # Fetch the thread for a single mail JSON line and emit an enriched JSON line.
@@ -176,12 +186,12 @@ fetch_threads() {
   local mail_count
 
   mail_count=$(grep --count . "$mails_file" || true)
-  log "Fetching threads for $mail_count mails in parallel"
+  log "Fetching thread(s) for $mail_count mail(s) in parallel"
 
   parallel --jobs "$SHERPA_PARALLEL_FETCHES" --halt soon,fail=10% --group \
     _fetch_mail_thread {} <"$mails_file" >>"$output_file"
 
-  log "Finished fetching $mail_count threads"
+  log "Finished fetching $mail_count thread(s)"
 }
 
 # Deduplicate and aggregate thread entries into a final JSON array, sorted by
@@ -216,8 +226,26 @@ main() {
   trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
   local mails_file="$tmpdir/mails" threads_file="$tmpdir/threads" result_file="$tmpdir/result"
-  local folders
-  folders=$(fetch_folders)
+  local folders all_folders
+  all_folders=$(fetch_folders)
+  if [[ ${#CLI_FOLDERS[@]} -gt 0 ]]; then
+    local invalid=()
+    for f in "${CLI_FOLDERS[@]}"; do
+      if ! grep --fixed-strings --line-regexp --quiet "$f" <<<"$all_folders"; then
+        invalid+=("$f")
+      fi
+    done
+    if [[ ${#invalid[@]} -gt 0 ]]; then
+      echo "Error: unknown folder(s): $(printf '"%s" ' "${invalid[@]}")" >&2
+      echo "Available folders:" >&2
+      echo "  ${all_folders//$'\n'/$'\n'  }" >&2
+      exit 1
+    fi
+    folders=$(printf '%s\n' "${CLI_FOLDERS[@]}")
+    log "Using ${#CLI_FOLDERS[@]} folder(s) from command line"
+  else
+    folders="$all_folders"
+  fi
 
   fetch_unseen_mails "$folders" "$mails_file"
   fetch_threads "$mails_file" "$threads_file"
