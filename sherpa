@@ -2,7 +2,7 @@
 set -EeuoP pipefail
 
 check_dependencies() {
-  for cmd in awk cut grep himalaya jq mktemp parallel sed shasum timeout tr; do
+  for cmd in awk cut grep himalaya jq mktemp parallel rm sed shasum timeout tr; do
     if ! command -v "$cmd" &>/dev/null; then
       echo "Missing required dependency: $cmd" >&2
       exit 1
